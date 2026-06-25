@@ -1,0 +1,259 @@
+import os
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt
+from extensions import db
+from models import User, Task, Payment, Rating, Notification
+from datetime import datetime, timedelta
+from sqlalchemy import func
+
+admin_bp = Blueprint("admin", __name__)
+
+def admin_required(fn):
+    from functools import wraps
+    @wraps(fn)
+    @jwt_required()
+    def wrapper(*args, **kwargs):
+        claims = get_jwt()
+        if claims.get("role") != "admin":
+            return jsonify({"error": "Admin access required"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+@admin_bp.route("/login", methods=["POST"])
+def admin_login():
+    data = request.get_json()
+    if (data.get("username") != os.getenv("ADMIN_USERNAME") or
+        data.get("password") != os.getenv("ADMIN_PASSWORD")):
+        return jsonify({"error": "Invalid admin credentials"}), 401
+    token = create_access_token(
+        identity="admin",
+        additional_claims={"role": "admin"},
+        expires_delta=timedelta(hours=8)
+    )
+    return jsonify({"token": token}), 200
+
+@admin_bp.route("/stats", methods=["GET"])
+@admin_required
+def get_stats():
+    total_users = User.query.count()
+    total_customers = User.query.filter_by(role="customer").count()
+    total_helpers = User.query.filter_by(role="helper").count()
+    total_tasks = Task.query.count()
+    open_tasks = Task.query.filter_by(status="open").count()
+    completed_tasks = Task.query.filter_by(status="done").count()
+    disputed_tasks = Task.query.filter_by(status="disputed").count()
+    cancelled_tasks = Task.query.filter_by(status="cancelled").count()
+    total_payments = Payment.query.filter_by(status="paid").count()
+    total_revenue = db.session.query(
+        func.sum(Payment.amount)
+    ).filter_by(status="paid").scalar() or 0
+    total_ratings = Rating.query.count()
+    avg_rating = db.session.query(
+        func.avg(Rating.stars)
+    ).scalar() or 0
+
+    recent_tasks = Task.query.order_by(
+        Task.created_at.desc()
+    ).limit(5).all()
+
+    recent_payments = Payment.query.filter_by(
+        status="paid"
+    ).order_by(Payment.created_at.desc()).limit(5).all()
+
+    return jsonify({
+        "users": {
+            "total": total_users,
+            "customers": total_customers,
+            "helpers": total_helpers
+        },
+        "tasks": {
+            "total": total_tasks,
+            "open": open_tasks,
+            "completed": completed_tasks,
+            "disputed": disputed_tasks,
+            "cancelled": cancelled_tasks
+        },
+        "payments": {
+            "total": total_payments,
+            "revenue": round(total_revenue, 2)
+        },
+        "ratings": {
+            "total": total_ratings,
+            "average": round(float(avg_rating), 1)
+        },
+        "recent_tasks": [{
+            "id": t.id,
+            "title": t.title,
+            "status": t.status,
+            "reward": t.reward,
+            "created_at": t.created_at.strftime("%d %b %Y")
+        } for t in recent_tasks],
+        "recent_payments": [{
+            "id": p.id,
+            "amount": p.amount,
+            "status": p.status,
+            "created_at": p.created_at.strftime("%d %b %Y")
+        } for p in recent_payments]
+    }), 200
+
+@admin_bp.route("/users", methods=["GET"])
+@admin_required
+def get_users():
+    search = request.args.get("search", "").strip()
+    role = request.args.get("role", "").strip()
+    query = User.query
+    if search:
+        query = query.filter(
+            db.or_(
+                User.name.ilike(f"%{search}%"),
+                User.email.ilike(f"%{search}%")
+            )
+        )
+    if role:
+        query = query.filter_by(role=role)
+    users = query.order_by(User.created_at.desc()).all()
+    result = []
+    for u in users:
+        tasks_posted = Task.query.filter_by(customer_id=u.id).count() if u.role == "customer" else 0
+        tasks_done = Task.query.filter_by(helper_id=u.id, status="done").count() if u.role == "helper" else 0
+        ratings = Rating.query.filter_by(helper_id=u.id).all()
+        avg = round(sum(r.stars for r in ratings) / len(ratings), 1) if ratings else 0
+        result.append({
+            "id": u.id,
+            "name": u.name,
+            "email": u.email,
+            "role": u.role,
+            "member_since": u.created_at.strftime("%d %b %Y"),
+            "tasks_posted": tasks_posted,
+            "tasks_done": tasks_done,
+            "avg_rating": avg,
+            "total_ratings": len(ratings)
+        })
+    return jsonify(result), 200
+
+@admin_bp.route("/tasks", methods=["GET"])
+@admin_required
+def get_tasks():
+    search = request.args.get("search", "").strip()
+    status = request.args.get("status", "").strip()
+    category = request.args.get("category", "").strip()
+    query = Task.query
+    if search:
+        query = query.filter(
+            db.or_(
+                Task.title.ilike(f"%{search}%"),
+                Task.description.ilike(f"%{search}%")
+            )
+        )
+    if status:
+        query = query.filter_by(status=status)
+    if category:
+        query = query.filter_by(category=category)
+    tasks = query.order_by(Task.created_at.desc()).all()
+    result = []
+    for t in tasks:
+        customer = User.query.get(t.customer_id)
+        helper = User.query.get(t.helper_id) if t.helper_id else None
+        result.append({
+            "id": t.id,
+            "title": t.title,
+            "description": t.description,
+            "category": t.category,
+            "status": t.status,
+            "reward": t.reward,
+            "location": t.location,
+            "payment_status": t.payment_status,
+            "customer_name": customer.name if customer else "N/A",
+            "customer_email": customer.email if customer else "N/A",
+            "helper_name": helper.name if helper else "Not assigned",
+            "completion_note": t.completion_note,
+            "dispute_reason": t.dispute_reason,
+            "created_at": t.created_at.strftime("%d %b %Y %H:%M"),
+            "accepted_at": t.accepted_at.strftime("%d %b %Y %H:%M") if t.accepted_at else None,
+            "completed_at": t.completed_at.strftime("%d %b %Y %H:%M") if t.completed_at else None,
+            "confirmed_at": t.confirmed_at.strftime("%d %b %Y %H:%M") if t.confirmed_at else None,
+        })
+    return jsonify(result), 200
+
+@admin_bp.route("/payments", methods=["GET"])
+@admin_required
+def get_payments():
+    search = request.args.get("search", "").strip()
+    status = request.args.get("status", "").strip()
+    query = Payment.query
+    if status:
+        query = query.filter_by(status=status)
+    payments = query.order_by(Payment.created_at.desc()).all()
+    result = []
+    for p in payments:
+        customer = User.query.get(p.customer_id)
+        task = Task.query.filter_by(razorpay_order_id=p.razorpay_order_id).first()
+        if search and customer:
+            if search.lower() not in customer.name.lower() and search.lower() not in customer.email.lower():
+                continue
+        result.append({
+            "id": p.id,
+            "amount": p.amount,
+            "status": p.status,
+            "razorpay_order_id": p.razorpay_order_id,
+            "razorpay_payment_id": p.razorpay_payment_id,
+            "customer_name": customer.name if customer else "N/A",
+            "customer_email": customer.email if customer else "N/A",
+            "task_title": task.title if task else "N/A",
+            "task_id": task.id if task else None,
+            "created_at": p.created_at.strftime("%d %b %Y %H:%M")
+        })
+    return jsonify(result), 200
+
+@admin_bp.route("/disputes", methods=["GET"])
+@admin_required
+def get_disputes():
+    tasks = Task.query.filter_by(
+        status="disputed"
+    ).order_by(Task.created_at.desc()).all()
+    result = []
+    for t in tasks:
+        customer = User.query.get(t.customer_id)
+        helper = User.query.get(t.helper_id) if t.helper_id else None
+        result.append({
+            "id": t.id,
+            "title": t.title,
+            "reward": t.reward,
+            "location": t.location,
+            "dispute_reason": t.dispute_reason,
+            "completion_note": t.completion_note,
+            "customer_name": customer.name if customer else "N/A",
+            "customer_email": customer.email if customer else "N/A",
+            "helper_name": helper.name if helper else "N/A",
+            "helper_email": helper.email if helper else "N/A",
+            "created_at": t.created_at.strftime("%d %b %Y %H:%M"),
+            "completed_at": t.completed_at.strftime("%d %b %Y %H:%M") if t.completed_at else None
+        })
+    return jsonify(result), 200
+
+@admin_bp.route("/leaderboard", methods=["GET"])
+@admin_required
+def get_leaderboard():
+    helpers = User.query.filter_by(role="helper").all()
+    result = []
+    for h in helpers:
+        tasks_done = Task.query.filter_by(helper_id=h.id, status="done").count()
+        ratings = Rating.query.filter_by(helper_id=h.id).all()
+        avg = round(sum(r.stars for r in ratings) / len(ratings), 1) if ratings else 0
+        total_earned = db.session.query(
+            func.sum(Task.reward)
+        ).filter_by(helper_id=h.id, status="done").scalar() or 0
+        result.append({
+            "id": h.id,
+            "name": h.name,
+            "email": h.email,
+            "tasks_done": tasks_done,
+            "avg_rating": avg,
+            "total_ratings": len(ratings),
+            "total_earned": round(float(total_earned), 2),
+            "member_since": h.created_at.strftime("%b %Y")
+        })
+    result.sort(key=lambda x: (x["tasks_done"], x["avg_rating"]), reverse=True)
+    for i, h in enumerate(result):
+        h["rank"] = i + 1
+    return jsonify(result), 200
